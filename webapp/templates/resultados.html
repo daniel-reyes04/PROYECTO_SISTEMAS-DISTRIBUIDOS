@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Recomendaciones - CineSense AI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script>
+        async function obtenerRecomendaciones() {
+            const res = await fetch("/api/recomendaciones");
+            const data = await res.json();
+            const cont = document.getElementById("resultados");
+
+            if (data.recomendaciones) {
+                cont.innerHTML = "";
+                data.recomendaciones.forEach(p => {
+                    const div = document.createElement("div");
+                    div.className = "card";
+                    div.innerHTML = `<h3>${p.titulo}</h3>
+                                     <p><b>Género:</b> ${p.genero}</p>
+                                     <p>${p.sinopsis}</p>`;
+                    cont.appendChild(div);
+                });
+            } else {
+                setTimeout(obtenerRecomendaciones, 3000);
+            }
+        }
+        window.onload = obtenerRecomendaciones;
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>Recomendaciones personalizadas</h1>
+        <p>Analizando tu emoción: <strong>{{ emocion }}</strong></p>
+        <div id="resultados"><p>Esperando respuesta del sistema de IA...</p></div>
+        <a href="/">⬅ Volver</a>
+    </div>
+</body>
+</html>

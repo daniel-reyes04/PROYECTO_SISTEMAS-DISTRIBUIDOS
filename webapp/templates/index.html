@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>CineSense AI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>CineSense AI</h1>
+        <p>¿Cómo te sientes hoy? Describe tu estado de ánimo y obtén recomendaciones personalizadas.</p>
+
+        <form method="POST">
+            <textarea name="texto" placeholder="Ejemplo: Me siento feliz y con energía..." required></textarea>
+            <button type="submit">Enviar</button>
+        </form>
+    </div>
+</body>
+</html>

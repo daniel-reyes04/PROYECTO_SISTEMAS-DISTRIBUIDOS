@@ -1,0 +1,9 @@
+pika
+psycopg2-binary
+transformers
+torch
+pysentimiento
+requests
+sentence-transformers
+numpy
+
