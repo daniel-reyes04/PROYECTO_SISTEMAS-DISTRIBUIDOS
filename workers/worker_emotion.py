@@ -44,7 +44,10 @@ def main():
         try:
             data = json.loads(body)
             texto = data.get("text", "")
-            print(f"[📩] Texto recibido: {texto}")
+            # [CORRECCIÓN 7] OBTENER el ID DE SOLICITUD
+            request_id = data.get("request_id") 
+
+            print(f"[📩] Texto recibido: {texto} (ID: {request_id})")
 
             result = analyzer.predict(texto)
             emocion = result.output
@@ -53,7 +56,8 @@ def main():
             ch.basic_publish(
                 exchange='',
                 routing_key='cola_emocion_detectada',
-                body=json.dumps({"emotion": emocion})
+                # [CORRECCIÓN 8] ENVIAR el ID DE SOLICITUD a la siguiente cola
+                body=json.dumps({"emotion": emocion, "request_id": request_id}) 
             )
             print(f"[📤] Emoción enviada a 'cola_emocion_detectada'")
             ch.basic_ack(delivery_tag=method.delivery_tag)

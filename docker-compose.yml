@@ -32,10 +32,10 @@ services:
       - cinesense_net
     healthcheck:
       test: ["CMD-SHELL", "rabbitmq-diagnostics -q status"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+      interval: 15s           # Intervalo entre pruebas
+      timeout: 20s            # Tiempo para que la prueba se complete (Aumentado)
+      retries: 8              # Número de reintentos (Aumentado)
+      start_period: 60s       # Período de gracia amplio para VMs lentas (Aumentado)
     restart: always
     env_file: .env
 
@@ -43,15 +43,13 @@ services:
     image: traefik:v2.10
     container_name: cinesense_traefik
     command:
+      - --api.insecure=true
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --entrypoints.web.address=:80
-      - --entrypoints.api.address=:8080
-      - --api.dashboard=true
-      - --api.insecure=true
     ports:
       - "80:80"
-      - "8081:8080"
+      - "8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -112,6 +110,7 @@ services:
       options:
         max-size: "5m"
         max-file: "3"
+        
   webapp:
     build: ./webapp
     container_name: cinesense_webapp
@@ -119,20 +118,22 @@ services:
       - "5000:5000"
     environment:
       RABBITMQ_HOST: rabbitmq
-      RABBITMQ_USER: ${RABBITMQ_USER}
-      RABBITMQ_PASS: ${RABBITMQ_PASS}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.cinesense.rule=Host(`cinesense.localhost`)"
+      - "traefik.http.routers.cinesense.entrypoints=web"
+    networks:
+      - cinesense_net
     depends_on:
       rabbitmq:
         condition: service_healthy
-    networks:
-      - cinesense_net
-
-
-
-networks:
-  cinesense_net:
-    driver: bridge
+    restart: always
 
 volumes:
   db-data:
-
+  
+networks:
+  cinesense_net:
+    driver: bridge
