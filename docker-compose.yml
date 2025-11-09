@@ -1,11 +1,14 @@
 services:
   db:
-    image: postgres:15
+    build: 
+      context: . 
+      dockerfile: Dockerfile.postgres 
     container_name: cinesense_db
     environment:
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
     volumes:
       - db-data:/var/lib/postgresql/data
     networks:
@@ -15,7 +18,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 20s
     restart: always
     env_file: .env
 
@@ -29,58 +32,50 @@ services:
       - "15672:15672"
       - "5672:5672"
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq  
+      - rabbitmq_data:/var/lib/rabbitmq 
     networks:
       - cinesense_net
     healthcheck:
       test: ["CMD-SHELL", "rabbitmq-diagnostics -q status"]
       interval: 15s
-      timeout: 20s
-      retries: 8
-      start_period: 60s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: always
     env_file: .env
 
-  traefik:
-    image: traefik:v2.10
-    container_name: cinesense_traefik
-    command:
-      - --api.insecure=true
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --entrypoints.web.address=:80
-    ports:
-      - "80:80"
-      - "8080:8080"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - cinesense_net
-    restart: always
-
+  # --- WORKER DE INICIALIZACIÓN (Una sola ejecución) ---
   worker_inicial:
-    build: ./workers
+    build: 
+      context: . 
+      dockerfile: Dockerfile.worker 
     container_name: cinesense_worker_inicial
-    command: python worker_inicial.py
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python scripts/worker_inicial.py
+    
     depends_on:
       db:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
     env_file: .env
-    restart: always
+    # 🚨 CRÍTICO: Removido 'restart: always' para que se ejecute y termine (código 0)
+    # y así evitar que el worker_recomendador se confunda.
     networks:
       - cinesense_net
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "3"
 
   worker_emotion:
-    build: ./workers
+    build: 
+      context: .
+      dockerfile: Dockerfile.worker
     container_name: cinesense_worker_emotion
-    command: python worker_emotion.py
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python workers/worker_emotion.py
+    
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -88,30 +83,30 @@ services:
     restart: always
     networks:
       - cinesense_net
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "3"
 
+  # --- WORKER RECOMENDADOR (Servicio de escucha constante) ---
   worker_recomendador:
-    build: ./workers
+    build: 
+      context: .
+      dockerfile: Dockerfile.worker
     container_name: cinesense_worker_recomendador
-    command: python worker_recomendador.py
+    volumes:
+      - .:/app
+    working_dir: /app
+    # 🚨 Comando corregido a la ruta correcta si está dentro de una carpeta
+    command: python workers/worker_recomendador.py
+    
     depends_on:
+      # Depende de que la DB y RabbitMQ estén sanos
       db:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
     env_file: .env
+    # 🚨 CRÍTICO: Este sí debe reiniciarse siempre, ya que es un servicio de escucha
     restart: always
     networks:
       - cinesense_net
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "3"
         
   webapp:
     build: ./webapp
@@ -122,21 +117,23 @@ services:
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.cinesense.rule=Host(`cinesense.localhost`)"
-      - "traefik.http.routers.cinesense.entrypoints=web"
-    networks:
-      - cinesense_net
+    volumes:
+      - .:/app 
+    working_dir: /app
+    command: python app.py 
+    
     depends_on:
       rabbitmq:
         condition: service_healthy
+    env_file: .env
     restart: always
+    networks:
+      - cinesense_net
 
 volumes:
   db-data:
   rabbitmq_data:
-  
+
 networks:
   cinesense_net:
     driver: bridge
