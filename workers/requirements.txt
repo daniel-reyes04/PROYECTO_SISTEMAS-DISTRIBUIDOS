@@ -6,4 +6,5 @@ pysentimiento
 requests
 sentence-transformers
 numpy
+google-genai
 

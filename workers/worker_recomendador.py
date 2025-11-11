@@ -1,184 +1,338 @@
 import pika
 import os
 import time
-import requests
 import psycopg2
 import json
-from sentence_transformers import SentenceTransformer
+import requests
 from psycopg2 import sql
+from pika.exceptions import AMQPConnectionError, ConnectionClosedByBroker
 
-# ---------------- CONFIGURACIONES ---------------- #
+# --- IMPORTACIONES DE IA ---
+# Importamos SentenceTransformer
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    print("🚨 ERROR: No se encontró la librería 'sentence_transformers'. Usando clase dummy.")
+    class SentenceTransformer:
+        def __init__(self, *args, **kwargs): pass 
+        def encode(self, *args, **kwargs): return [0.0] * 384
+        def get_sentence_embedding_dimension(self): return 384
+
+# Importamos la librería de Gemini
+try:
+    from google import genai
+    from google.genai.errors import APIError 
+except ImportError:
+    print("🚨 ERROR: No se encontró la librería 'google-genai'. La personalización de sinopsis estará deshabilitada.")
+    # Clases dummy para evitar errores
+    class genai:
+        class Client:
+            def __init__(self, **kwargs): pass
+            class models:
+                def generate_content(self, **kwargs):
+                    raise NotImplementedError("Gemini client not initialized.")
+    class APIError(Exception): pass
+# -----------------------------
+
+MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+try:
+    sbert_model = SentenceTransformer(MODEL_NAME)
+    EMBEDDING_DIM = sbert_model.get_sentence_embedding_dimension()
+    print(f"✅ Modelo S-BERT cargado. Dimensión: {EMBEDDING_DIM}")
+except Exception as e:
+    print(f"⚠️ Advertencia: No se pudo cargar el modelo SBERT. Usando dummy: {e}")
+    sbert_model = SentenceTransformer()
+    EMBEDDING_DIM = sbert_model.get_sentence_embedding_dimension()
+
+
+# ---------------- CONFIGURACIONES GLOBALES ---------------- #
 RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'rabbitmq')
 RABBITMQ_USER = os.getenv('RABBITMQ_DEFAULT_USER', 'guest')
 RABBITMQ_PASS = os.getenv('RABBITMQ_DEFAULT_PASS', 'guest')
-# La cola que usa la WebApp para enviar consultas de recomendación
-QUEUE_NAME = 'recommendation_queue' 
 
+# Colas
+QUEUE_NAME_IN = 'cola_emocion_detectada' 
+QUEUE_NAME_OUT = 'cola_resultados_finales'
+
+# Configuración de la base de datos
 DB_HOST = os.getenv('DB_HOST', 'db')
 DB_NAME = os.getenv('DB_NAME', 'cinesense_ai_db')
 DB_USER = os.getenv('DB_USER', 'cinesense_user')
-DB_PASS = os.getenv('DB_PASS', 'cinesense_pass')
+DB_PASS = os.getenv('DB_PASS', 'password')
 
-MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-model = SentenceTransformer(MODEL_NAME)
-EMBEDDING_DIM = model.get_sentence_embedding_dimension()
+# Configuración de Gemini
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_MODEL = 'gemini-2.5-flash' # Modelo rápido para esta tarea
+GEMINI_CLIENT = None
+# --------------------------------------------------------- #
 
+
+# --- INICIALIZACIÓN DE GEMINI ---
+def init_gemini_client():
+    """Inicializa el cliente de Gemini si la API key está disponible."""
+    global GEMINI_CLIENT
+    if GEMINI_API_KEY:
+        try:
+            # Intentar inicializar el cliente solo si la librería fue importada
+            if 'genai' in globals():
+                GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+                print("✅ Cliente de Gemini inicializado.")
+                return True
+        except Exception as e:
+            print(f"🚨 Error inicializando cliente Gemini: {e}")
+            GEMINI_CLIENT = None
+    else:
+        print("🚨 ERROR: GEMINI_API_KEY no configurada. La reescritura de sinopsis estará deshabilitada.")
+    return False
+
+# --- FUNCIÓN DE REESCRITURA CON GEMINI ---
+def rewrite_synopsis_with_gemini(synopsis: str, emotion: str) -> str:
+    """
+    Usa la API de Gemini para reescribir la sinopsis, ajustando el tono a la emoción.
+    """
+    if not GEMINI_CLIENT:
+        return synopsis # Retorna el original si el cliente no está disponible
+    
+    # Prompt para personalizar la sinopsis
+    prompt = f"""
+    Eres un experto en marketing de películas. Reescribe la siguiente sinopsis para hacerla 
+    extremadamente atractiva y relevante para un usuario que se siente **{emotion}**.
+
+    Mantente fiel al argumento central. Ajusta el tono para apelar a la emoción del usuario:
+    - Si la emoción es 'Tristeza' o 'Miedo', enfoca el resumen en la superación, la esperanza o la catarsis.
+    - Si la emoción es 'Alegría' o 'Diversión', resalta el humor, la aventura y la energía positiva.
+
+    El resultado debe ser **solo la sinopsis reescrita**, sin encabezados, comillas ni explicaciones adicionales. Máximo 3 frases.
+
+    Sinopsis Original: "{synopsis}"
+    Emoción del Usuario: "{emotion}"
+    """
+
+    try:
+        response = GEMINI_CLIENT.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
+        new_synopsis = response.text.strip().replace('"', '')
+        # print(f"✨ Sinopsis reescrita para '{emotion}'.")
+        return new_synopsis
+    except APIError as e:
+        print(f"⚠️ Error en la llamada a la API de Gemini. Fallback a sinopsis original: {e}")
+        return synopsis
+    except Exception as e:
+        print(f"⚠️ Error inesperado al usar Gemini. Fallback: {e}")
+        return synopsis
 
 # ---------------- CONEXIÓN DB ---------------- #
 def get_db_connection():
-    """Establece una conexión a la base de datos con reintentos."""
-    max_retries = 15
-    for attempt in range(max_retries):
+    """Intenta conectarse a PostgreSQL con reintentos."""
+    max_retries = 10
+    for i in range(max_retries):
         try:
             conn = psycopg2.connect(
                 host=DB_HOST,
                 database=DB_NAME,
                 user=DB_USER,
-                password=DB_PASS,
-                port=5432
+                password=DB_PASS
             )
             return conn
-        except psycopg2.OperationalError:
-            time.sleep(3)
-    raise Exception("❌ No se pudo conectar a la base de datos después de varios intentos.")
+        except psycopg2.OperationalError as e:
+            print(f"⏳ DB no disponible (intento {i + 1}/{max_retries}). Reintentando en 5s...")
+            time.sleep(5)
+    raise Exception("🚨 No se pudo conectar a la base de datos después de múltiples intentos.")
 
+# ---------------- CONEXIÓN RABBITMQ ---------------- #
+def get_rabbitmq_connection():
+    """Intenta conectarse a RabbitMQ con reintentos."""
+    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+    parameters = pika.ConnectionParameters(
+        host=RABBITMQ_HOST, 
+        port=5672, 
+        credentials=credentials,
+        heartbeat=600
+    )
+    return pika.BlockingConnection(parameters)
 
 # ---------------- LÓGICA DE RECOMENDACIÓN ---------------- #
 
-def find_recommendation(conn, user_query):
+def get_recommendations_from_db(conn, emotion, limit=3):
     """
-    Genera el embedding de la consulta del usuario y encuentra la película más similar 
-    usando la distancia del coseno (operador '<=>' de pgvector).
+    Busca las 'limit' películas más cercanas a la emoción/sentimiento dado.
+    (Tu lógica de S-BERT y pgvector)
     """
-    print(f"🧠 Generando embedding para la consulta: '{user_query}'")
+    global sbert_model, EMBEDDING_DIM
     
-    # 1. Generar el embedding de la consulta
-    query_embedding = model.encode([user_query])[0]
-    query_embedding_list = query_embedding.tolist()
+    query_text = f"Una película que me haga sentir {emotion.lower()}"
     
-    # 2. Convertir el embedding de la consulta a formato string/json para PostgreSQL
-    vector_string = json.dumps(query_embedding_list)
+    if sbert_model:
+        emotion_embedding = sbert_model.encode(query_text).tolist()
+    else:
+        emotion_embedding = [0.0] * EMBEDDING_DIM
+
+    embedding_str = '[' + ','.join(map(str, emotion_embedding)) + ']'
     
-    # 3. Buscar la película con el embedding más cercano (operador de distancia del coseno '<=>')
-    select_query = sql.SQL("""
-        SELECT 
-            titulo, 
-            sinopsis_original, 
-            rating_imdb,
-            # El operador '<=>' calcula la distancia del coseno.
-            embedding_sinopsis <=> %s::vector AS distance
-        FROM Peliculas 
-        WHERE embedding_sinopsis IS NOT NULL
-        ORDER BY distance ASC
-        LIMIT 1;
-    """)
+    # print(f"[🔍] Buscando películas similares a: '{query_text}' (vector dim: {EMBEDDING_DIM})")
     
-    with conn.cursor() as cursor:
-        cursor.execute(select_query, (vector_string,))
-        result = cursor.fetchone()
-        
-        if result:
-            titulo, sinopsis, rating, distance = result
-            # La distancia del coseno va de 0 a 2. Cercano a 0 es más similar.
-            similarity = 1 - distance / 2
+    try:
+        with conn.cursor() as cursor:
+            # Consulta de similitud vectorial (coseno)
+            query = sql.SQL("""
+                SELECT
+                    titulo,
+                    resumen,
+                    rating_imdb,
+                    1 - (embedding <=> %s) AS score
+                FROM
+                    Peliculas
+                WHERE 
+                    embedding IS NOT NULL
+                ORDER BY
+                    embedding <=> %s
+                LIMIT %s;
+            """)
             
-            return {
-                "titulo": titulo,
-                "sinopsis": sinopsis,
-                "rating": f"{rating:.2f}/10",
-                "similitud": f"{similarity:.4f}"
-            }
-        
-    return None
+            cursor.execute(query, [embedding_str, embedding_str, limit])
+            
+            results = cursor.fetchall()
+            recommendations = []
+            
+            if not results:
+                 return [] 
+
+            for titulo, resumen, rating, score in results:
+                recommendations.append({
+                    "titulo": titulo,
+                    "resumen": resumen,
+                    "rating_imdb": float(rating),
+                    "score": float(score),
+                    "emocion_buscada": emotion
+                })
+            return recommendations
+
+    except psycopg2.Error as e:
+        print(f"🚨 ERROR de DB al obtener recomendaciones: {e}")
+        return []
+    except Exception as e:
+        print(f"🚨 Error inesperado en la lógica de recomendación: {e}")
+        return []
 
 
-# ---------------- CONSUMIDOR RABBITMQ ---------------- #
-
+# ---------------- CONSUMIDOR DE RABBITMQ ---------------- #
 def callback(ch, method, properties, body):
-    """Procesa el mensaje de la cola: encuentra la recomendación y la imprime."""
+    conn = None
     try:
         data = json.loads(body)
-        user_query = data.get('query', 'No se especificó consulta')
+        # CORRECCIÓN: El worker_emotion.py envía 'emotion'
+        emotion = data.get("emotion") 
+        request_id = data.get("request_id")
         
-        print(f"⚙️ Recibido nuevo trabajo: Consulta de usuario: '{user_query}'")
-        
-        # Conectar a la DB e intentar la recomendación
+        print(f"\n[📩] Mensaje recibido de '{QUEUE_NAME_IN}': Emoción '{emotion}' (ID: {request_id})")
+
+        if not emotion or not request_id:
+            print(f"⚠️ Mensaje inválido. Faltan datos. Body: {data}")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+
+        # 1. Lógica de Recomendación (DB)
         conn = get_db_connection()
-        recommendation = find_recommendation(conn, user_query)
-        conn.close()
+        recommendations = get_recommendations_from_db(conn, emotion, limit=5)
         
-        if recommendation:
-            print("✨ RECOMENDACIÓN ENCONTRADA:")
-            print(f"   Título: {recommendation['titulo']}")
-            print(f"   Similitud (Coseno): {recommendation['similitud']}")
-            # Nota: En un sistema real, aquí se enviaría la recomendación de vuelta 
-            # a una cola de respuesta que la WebApp estaría escuchando.
-        else:
-            print("⚠️ No se pudo encontrar una recomendación.")
-            
-        # Confirma que el mensaje fue procesado correctamente
+        # 2. PERSONALIZACIÓN DE LA SINOPSIS CON GEMINI (Paso Clave)
+        if recommendations:
+            for movie in recommendations:
+                original_synopsis = movie.get('resumen')
+                
+                # Eliminamos la clave 'resumen' original de la DB (ya no es necesaria)
+                if 'resumen' in movie:
+                    del movie['resumen']
+                    
+                if original_synopsis:
+                    # ✅ CORRECCIÓN 1: Usar 'sinopsis' (esperado por el frontend)
+                    movie['sinopsis'] = rewrite_synopsis_with_gemini(original_synopsis, emotion)
+                    
+                    # ✅ CORRECCIÓN 2: Usar 'emocion_usada' (esperado por el frontend)
+                    movie['emocion_usada'] = emotion
+                else:
+                    # Asegurarse de que al menos la clave exista si no hubo sinopsis original
+                    movie['sinopsis'] = "Sin sinopsis original disponible para personalizar."
+                    movie['emocion_usada'] = emotion
+        
+        # 3. Envío del resultado final
+        final_payload = json.dumps({
+            "request_id": request_id,
+            "recommendations": recommendations
+        })
+        
+        ch.basic_publish(
+            exchange='',
+            routing_key=QUEUE_NAME_OUT,
+            body=final_payload,
+            properties=pika.BasicProperties(
+                delivery_mode=2,
+            )
+        )
+        
+        print(f"[📤] Recomendaciones (personalizadas) enviadas a '{QUEUE_NAME_OUT}' para ID: {request_id}")
+        
         ch.basic_ack(delivery_tag=method.delivery_tag)
         
+    except json.JSONDecodeError:
+        print(f"⚠️ Error de JSON Decode. Cuerpo del mensaje: {body}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
     except Exception as e:
-        print(f"❌ Error al procesar mensaje: {e}")
-        # En caso de error, puedes optar por no hacer ack para que RabbitMQ reencole el mensaje
-        # ch.basic_nack(delivery_tag=method.delivery_tag)
-        ch.basic_ack(delivery_tag=method.delivery_tag) # Mantener ACK simple por ahora
+        print(f"🚨 ERROR CRÍTICO en callback del Recomendador: {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True) 
+    finally:
+        if conn:
+            conn.close()
+            
+# ---------------- MAIN ---------------- #
+if __name__ == "__main__":
+    print("\n--- Iniciando Worker Recomendador ---")
+    
+    # 1. Inicializar cliente Gemini
+    init_gemini_client()
+    
+    # 2. Verificar/Esperar DB
+    try:
+        conn = get_db_connection()
+        conn.close()
+        print("✅ Conexión inicial a DB exitosa.")
+    except Exception as e:
+        print(f"🚨 ERROR FATAL: La DB no está disponible al iniciar. {e}")
+        exit(1)
 
-
-def start_consumer():
-    """Conecta a RabbitMQ y comienza a escuchar la cola de recomendaciones."""
-    print(f"🎬 Worker Recomendador iniciado. Escuchando en '{QUEUE_NAME}'...")
+    # 3. Conectar a RabbitMQ e iniciar consumidor
     max_retries = 10
-    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-
-    for attempt in range(max_retries):
+    attempt = 0
+    while attempt < max_retries:
         try:
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=RABBITMQ_HOST, 
-                    port=5672,
-                    heartbeat=600,
-                    credentials=credentials
-                )
-            )
+            connection = get_rabbitmq_connection()
             channel = connection.channel()
-            # Declaramos la cola (debe ser la misma que usa la WebApp)
-            channel.queue_declare(queue=QUEUE_NAME, durable=True)
             
-            # Aseguramos que solo tome un mensaje a la vez
+            channel.queue_declare(queue=QUEUE_NAME_IN, durable=True)
+            channel.queue_declare(queue=QUEUE_NAME_OUT, durable=True)
+
             channel.basic_qos(prefetch_count=1) 
-            
-            channel.basic_consume(queue=QUEUE_NAME, on_message_callback=callback)
-            
-            print('✅ Esperando mensajes. Presiona CTRL+C para salir.')
+            channel.basic_consume(queue=QUEUE_NAME_IN, on_message_callback=callback, auto_ack=False) 
+            print(f'✅ Worker Recomendador listo. Esperando mensajes en la cola: {QUEUE_NAME_IN}.')
             channel.start_consuming()
 
-        except pika.exceptions.AMQPConnectionError as e:
-            print(f"⏳ RabbitMQ no disponible (intento {attempt + 1}/{max_retries}). Reintentando en {5} segundos...")
+        except (AMQPConnectionError, ConnectionClosedByBroker) as e:
+            print(f"❌ Conexión RabbitMQ fallida. Reiniciando conexión en 5 segundos... ({e})")
             time.sleep(5)
-            if attempt == max_retries - 1:
-                raise Exception("❌ No se pudo conectar a RabbitMQ después de múltiples intentos.")
+            attempt += 1
         except KeyboardInterrupt:
             print("\nShutting down consumer...")
             break
         except Exception as e:
             print(f"Error inesperado en el consumidor: {e}. Reiniciando en 5 segundos...")
             time.sleep(5)
+            attempt += 1
             
-    # Si la conexión se estableció y se rompió, cerrar
     if 'connection' in locals() and connection.is_open:
         connection.close()
-
-
-if __name__ == "__main__":
-    # Intentamos la conexión a la DB una vez para asegurar que esté en línea
-    try:
-        conn = get_db_connection()
-        conn.close()
-        print("✅ Conexión inicial a DB exitosa. Iniciando consumidor.")
-        start_consumer()
-    except Exception as e:
-        print(f"🚨 Error crítico de inicio: {e}")
-        # El contenedor saldrá y Docker Compose lo reiniciará (restart: always)
-        exit(1)
+        print("🔌 Conexión RabbitMQ cerrada.")
+    
+    if attempt >= max_retries:
+        print("🚨 No se pudo conectar a RabbitMQ después de múltiples intentos. Saliendo.")

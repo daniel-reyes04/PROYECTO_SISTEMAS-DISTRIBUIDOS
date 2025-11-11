@@ -4,13 +4,29 @@ import time
 import requests
 import psycopg2
 import json
-from sentence_transformers import SentenceTransformer
+from psycopg2 import sql
+from pika.exceptions import AMQPConnectionError
+# Importamos SentenceTransformer
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    print("🚨 ERROR: No se encontró la librería 'sentence_transformers'. Asegúrate de que esté en requirements.txt.")
+    # Clase simulada para evitar un error fatal si el worker es invocado sin la librería.
+    class SentenceTransformer:
+        def __init__(self, *args, **kwargs):
+            # Usar un modelo pequeño multilingüe
+            pass 
+        def encode(self, *args, **kwargs):
+            # Retorna un vector dummy si no está instalado
+            return [0.0] * 384
+        def get_sentence_embedding_dimension(self):
+            return 384
 
 # ---------------- CONFIGURACIONES ---------------- #
 RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'rabbitmq')
-RABBITMQ_USER = os.getenv('RABBITMQ_USER', 'user')
-RABBITMQ_PASS = os.getenv('RABBITMQ_PASS', 'password')
-QUEUE_NAME = 'cola_indexacion_pelicula'
+RABBITMQ_USER = os.getenv('RABBITMQ_DEFAULT_USER', 'guest') 
+RABBITMQ_PASS = os.getenv('RABBITMQ_DEFAULT_PASS', 'guest') 
+QUEUE_NAME = 'cola_indexacion_pelicula' 
 
 DB_HOST = os.getenv('DB_HOST', 'db')
 DB_NAME = os.getenv('DB_NAME', 'cinesense_ai_db')
@@ -21,13 +37,24 @@ TMDB_API_KEY = os.getenv('TMDB_API_KEY')
 TMDB_URL = "https://api.themoviedb.org/3/movie/popular"
 
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-model = SentenceTransformer(MODEL_NAME)
-EMBEDDING_DIM = model.get_sentence_embedding_dimension()
+# Inicialización del modelo (solo ocurre una vez al inicio)
+try:
+    model = SentenceTransformer(MODEL_NAME)
+    EMBEDDING_DIM = model.get_sentence_embedding_dimension()
+except Exception as e:
+    print(f"⚠️ Advertencia: No se pudo cargar el modelo SBERT. Usando dummy: {e}")
+    # Definición de la clase DummyModel en caso de error
+    class DummyModel:
+        def encode(self, *args, **kwargs): return [0.0] * 384
+        def get_sentence_embedding_dimension(self): return 384
+    model = DummyModel()
+    EMBEDDING_DIM = model.get_sentence_embedding_dimension()
 
 
 # ---------------- CONEXIÓN DB ---------------- #
 def get_db_connection():
-    while True:
+    max_retries = 15
+    for attempt in range(max_retries):
         try:
             conn = psycopg2.connect(
                 host=DB_HOST,
@@ -35,178 +62,198 @@ def get_db_connection():
                 user=DB_USER,
                 password=DB_PASS
             )
-            print("✅ Conexión a la Base de Datos establecida.")
             return conn
-        except psycopg2.OperationalError:
-            print("⏳ Esperando conexión con la DB...")
+        except psycopg2.OperationalError as e:
+            print(f"⏳ DB no disponible (intento {attempt + 1}/{max_retries}): {e}. Reintentando en 3 segundos...")
             time.sleep(3)
+    raise Exception("❌ No se pudo conectar a la base de datos después de varios intentos.")
 
 
-# ---------------- CREACIÓN DE TABLAS ---------------- #
+# ---------------- TABLAS ---------------- #
 def create_tables(conn):
-    with conn.cursor() as cursor:
-        print("🧱 Recreando tablas...")
-        cursor.execute("DROP TABLE IF EXISTS Recomendaciones;")
-        cursor.execute("DROP TABLE IF EXISTS Usuarios;")
-        cursor.execute("DROP TABLE IF EXISTS Peliculas;")
+    print("🛠️ Creando/Verificando tablas y extensión pgvector...")
+    try:
+        with conn.cursor() as cursor:
+            # 1. Habilitar pgvector
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            
+            # 2. Crear tabla Peliculas. CORRECCIÓN: Usar 'resumen' como columna de sinopsis.
+            cursor.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS Peliculas (
+                    id SERIAL PRIMARY KEY,
+                    tmdb_id INTEGER UNIQUE NOT NULL,
+                    titulo VARCHAR(255) NOT NULL,
+                    resumen TEXT, 
+                    rating_imdb NUMERIC(2, 1),
+                    embedding VECTOR(%(dim)s)
+                );
+            """), {'dim': EMBEDDING_DIM})
+            
+            conn.commit()
+        print("✅ Tablas listas.")
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error al crear tablas: {e}")
+        
+        
+def fetch_and_store_movies(conn, url, api_key, limit=500):
+    print(f"📡 Cargando hasta {limit} películas populares de TMDB...")
+    headers = {} 
+    page = 1
+    total_loaded = 0
 
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS Peliculas (
-                id SERIAL PRIMARY KEY,
-                tmdb_id INT UNIQUE NOT NULL,
-                titulo VARCHAR(255) NOT NULL,
-                genero JSONB,
-                rating_imdb DECIMAL(3, 2),
-                sinopsis_original TEXT,
-                embedding_sinopsis JSONB,
-                fecha_lanzamiento DATE
-            );
-        """)
+    while total_loaded < limit:
+        # AÑADIDO: Incluimos 'api_key' directamente en los parámetros de la URL
+        params = {"language": "es-ES", "page": page, "api_key": api_key} 
+        
+        try:
+            # La solicitud ahora envía la clave en el query string: .../popular?api_key=XXX...
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status() # Esto lanzará el 401 si la clave sigue siendo inválida
+            data = response.json()
+            
+            movies_to_insert = []
+            for movie in data.get('results', []):
+                # Detener si se alcanza el límite
+                if total_loaded >= limit:
+                    break
+                    
+                # Extraer datos. NOTA: El 'overview' de TMDB va a la columna 'resumen'
+                movies_to_insert.append((
+                    movie.get('id'),
+                    movie.get('title'),
+                    movie.get('overview'), # overview de TMDB es el resumen/descripción
+                    movie.get('vote_average')
+                ))
+                total_loaded += 1
+                
+            if not data.get('results') or data.get('page') >= data.get('total_pages', 0):
+                break
+                
+            page += 1
+            
+            # Insertar en DB
+            if movies_to_insert:
+                print(f"💾 Insertando {len(movies_to_insert)} películas...")
+                with conn.cursor() as cursor:
+                    # Usamos ON CONFLICT para ignorar películas duplicadas
+                    insert_query = """
+                        INSERT INTO Peliculas (tmdb_id, titulo, resumen, rating_imdb)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (tmdb_id) DO NOTHING;
+                    """
+                    cursor.executemany(insert_query, movies_to_insert)
+                    conn.commit()
+            
+            # Si se alcanzó el límite, salimos del bucle
+            if total_loaded >= limit:
+                break
+                
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Error al conectar con TMDB: {e}")
+            break
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ Error al insertar datos en DB: {e}")
+            break
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Usuarios (
-                id SERIAL PRIMARY KEY,
-                nombre VARCHAR(100) NOT NULL,
-                email VARCHAR(255) UNIQUE NOT NULL
-            );
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Recomendaciones (
-                id SERIAL PRIMARY KEY,
-                usuario_id INT REFERENCES Usuarios(id),
-                pelicula_id INT REFERENCES Peliculas(id),
-                emocion_detectada VARCHAR(50),
-                fecha_recomendacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-
-        conn.commit()
-        print("✅ Tablas creadas exitosamente.")
+    print(f"✅ Carga de películas finalizada. Total cargadas: {total_loaded}.")
 
 
-# ---------------- OBTENER Y GUARDAR PELÍCULAS ---------------- #
-def fetch_and_store_movies(conn, api_url, api_key, limit=20):
-    print(f"🎬 Obteniendo {limit} películas desde TMDB...")
-    params = {'api_key': api_key, 'language': 'es-ES', 'page': 1}
+# ---------------- EMBEDDINGS ---------------- #
+def get_movie_ids_for_embedding(conn):
+    """Obtiene IDs y resumen de películas que no tienen embedding."""
+    try:
+        with conn.cursor() as cursor:
+            # CORRECCIÓN: Obtener el id de TMDB y el resumen
+            cursor.execute("SELECT tmdb_id, resumen FROM Peliculas WHERE embedding IS NULL;")
+            return cursor.fetchall()
+    except Exception as e:
+        print(f"❌ Error al obtener películas para embedding: {e}")
+        return []
+
+def generate_embeddings(conn):
+    print("🧠 Generando embeddings para películas sin procesar...")
+    movies_to_process = get_movie_ids_for_embedding(conn)
+    
+    if not movies_to_process:
+        print("✅ Todas las películas ya tienen embedding.")
+        return
+
+    print(f"🎥 Se necesitan procesar {len(movies_to_process)} películas.")
+    
+    # Prepara los textos: se usa solo el resumen para el embedding de similitud
+    # Filtramos por resumen vacío, aunque la DB permite NULL, para evitar errores en el encode
+    texts = [resumen for _, resumen in movies_to_process if resumen]
+    tmdb_ids = [tmdb_id for tmdb_id, resumen in movies_to_process if resumen]
+    
+    if not texts:
+        print("⚠️ No hay resúmenes válidos para generar embeddings.")
+        return
 
     try:
-        response = requests.get(api_url, params=params)
-        response.raise_for_status()
-        data = response.json()
+        # Generar embeddings
+        embeddings = model.encode(texts, convert_to_tensor=False)
+        print(f"✅ Embeddings generados para {len(embeddings)} textos.")
+
+        # Actualizar la base de datos
+        updates = []
+        for tmdb_id, embedding in zip(tmdb_ids, embeddings):
+            # El embedding debe convertirse a una cadena con formato de array de PostgreSQL
+            embedding_str = '[' + ','.join(map(str, embedding)) + ']'
+            updates.append((embedding_str, tmdb_id))
 
         with conn.cursor() as cursor:
-            inserted = 0
-            for movie in data.get('results', [])[:limit]:
-                if movie.get('overview'):
-                    cursor.execute("""
-                        INSERT INTO Peliculas (tmdb_id, titulo, genero, rating_imdb, sinopsis_original, fecha_lanzamiento)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (tmdb_id) DO NOTHING;
-                    """, (
-                        movie.get('id'),
-                        movie.get('title'),
-                        json.dumps(movie.get('genre_ids', [])),
-                        movie.get('vote_average'),
-                        movie.get('overview'),
-                        movie.get('release_date')
-                    ))
-                    inserted += 1
+            update_query = "UPDATE Peliculas SET embedding = %s WHERE tmdb_id = %s;"
+            cursor.executemany(update_query, updates)
             conn.commit()
-        print(f"✅ {inserted} películas insertadas en la base de datos.")
+        print("✅ Base de datos actualizada con nuevos embeddings.")
 
-    except requests.exceptions.RequestException as e:
-        print(f"⚠️ Error de red al obtener películas: {e}")
     except Exception as e:
-        print(f"⚠️ Error inesperado al insertar películas: {e}")
-
-
-# ---------------- GENERAR EMBEDDINGS ---------------- #
-def generate_embeddings(conn):
-    print("🧠 Generando embeddings para las películas sin vectorizar...")
-    with conn.cursor() as cursor:
-        cursor.execute("SELECT id, sinopsis_original FROM Peliculas WHERE embedding_sinopsis IS NULL;")
-        rows = cursor.fetchall()
-
-        for movie_id, sinopsis in rows:
-            try:
-                embedding = model.encode(sinopsis).tolist()
-                cursor.execute(
-                    "UPDATE Peliculas SET embedding_sinopsis = %s WHERE id = %s;",
-                    (json.dumps(embedding), movie_id)
-                )
-            except Exception as e:
-                print(f"⚠️ Error al generar embedding para película ID {movie_id}: {e}")
-
-        conn.commit()
-    print(f"✅ {len(rows)} embeddings generados y almacenados.")
-
-
-# ---------------- OBTENER IDS Y PUBLICAR A RABBITMQ ---------------- #
-def get_movie_ids_for_indexing(conn):
-    with conn.cursor() as cursor:
-        cursor.execute("SELECT id FROM Peliculas;")
-        return [row[0] for row in cursor.fetchall()]
-
-
-def publish_for_indexing(movie_ids, max_retries=5):
-    print("🚀 Encolando películas para indexación en RabbitMQ...")
-    for attempt in range(max_retries):
-        try:
-            credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-            parameters = pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials)
-            with pika.BlockingConnection(parameters) as connection:
-                channel = connection.channel()
-                channel.queue_declare(queue=QUEUE_NAME, durable=True)
-
-                for movie_id in movie_ids:
-                    message = json.dumps({"pelicula_id": movie_id})
-                    channel.basic_publish(
-                        exchange='',
-                        routing_key=QUEUE_NAME,
-                        body=message,
-                        properties=pika.BasicProperties(delivery_mode=pika.spec.DeliveryMode.Persistent)
-                    )
-
-                print(f"✅ {len(movie_ids)} IDs de películas encoladas correctamente.")
-                return
-        except pika.exceptions.AMQPConnectionError:
-            print(f"⏳ RabbitMQ no disponible (intento {attempt + 1}/{max_retries})...")
-            time.sleep(3)
-    print("❌ No se pudo conectar con RabbitMQ después de varios intentos.")
+        conn.rollback()
+        print(f"❌ Error al generar/guardar embeddings: {e}")
 
 
 # ---------------- VERIFICACIÓN ---------------- #
 def verify_population(conn):
     print("🔎 Verificando base de datos...")
     with conn.cursor() as cursor:
-        cursor.execute("SELECT titulo, rating_imdb FROM Peliculas LIMIT 3;")
+        # Incluir 'resumen' y estado del 'embedding' para la verificación
+        cursor.execute("SELECT titulo, resumen, rating_imdb, embedding FROM Peliculas LIMIT 3;") 
         results = cursor.fetchall()
         if results:
             print(f"🎥 Se encontraron {len(results)} películas de prueba:")
-            for i, (titulo, rating) in enumerate(results):
-                print(f"  {i+1}. {titulo} ({rating}/10)")
+            for i, (titulo, resumen, rating, embedding) in enumerate(results):
+                # El embedding es un array/cadena de texto, si tiene contenido, asumimos que existe
+                embedding_status = "Sí" if embedding else "No"
+                print(f"  {i+1}. {titulo} ({rating}/10) | Resumen: {resumen[:50]}... | Embedding: {embedding_status}")
         else:
             print("⚠️ No hay películas cargadas.")
 
 
 # ---------------- MAIN ---------------- #
 if __name__ == "__main__":
+    print("\n--- Iniciando Worker Inicial de DB ---")
     db_conn = get_db_connection()
     try:
+        # 1. Crear extensión y tablas (asegurando columna 'resumen')
         create_tables(db_conn)
 
         if not TMDB_API_KEY:
             print("🚨 ERROR: TMDB_API_KEY no configurada. No se cargarán películas.")
         else:
-            fetch_and_store_movies(db_conn, TMDB_URL, TMDB_API_KEY, limit=5)
+            # 2. Cargar datos desde TMDB
+            fetch_and_store_movies(db_conn, TMDB_URL, TMDB_API_KEY, limit=50) # Aumentado a 50 para una mejor base
+            
+            # 3. Generar embeddings
             generate_embeddings(db_conn)
+            
+            # 4. Verificación final
             verify_population(db_conn)
-            movie_ids = get_movie_ids_for_indexing(db_conn)
-            publish_for_indexing(movie_ids)
-
+            
     except Exception as e:
-        print(f"🚨 ERROR FATAL en worker_inicial: {e}")
+        print(f"🚨 Error en el proceso inicial del worker: {e}")
     finally:
-        db_conn.close()
-        print("🔚 Conexión cerrada.")
+        if db_conn and not db_conn.closed:
+            db_conn.close()
+            print("🔌 Conexión a DB cerrada.")
