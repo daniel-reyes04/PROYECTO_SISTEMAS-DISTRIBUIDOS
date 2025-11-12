@@ -1,11 +1,5 @@
-# Usamos la imagen base estándar de PostgreSQL (no slim) para asegurar la disponibilidad
 FROM postgres:16
 
-# Instalar dependencias de compilación. Usamos el gestor de paquetes de Debian/Ubuntu.
-# Se incluye 'ca-certificates' para resolver problemas de SSL/HTTPS con git.
-# Usamos 'postgresql-server-dev-16' para compilar con la versión 16.
-# Notar que en la imagen estándar (no slim), el nombre del paquete puede cambiar a veces.
-# Usaremos `postgresql-server-dev-16` que es el nombre correcto en Debian/Postgres.
 RUN apt-get update && apt-get install -y \
     build-essential \
     postgresql-server-dev-16 \
@@ -14,15 +8,11 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
-# Clonar el repositorio de pgvector (versión 0.6.0 estable)
 RUN git clone --branch v0.6.0 https://github.com/pgvector/pgvector.git /tmp/pgvector
 
-# Compilar e instalar pgvector
 WORKDIR /tmp/pgvector
-# El comando 'make install' copia la extensión al directorio de PostgreSQL
 RUN make \
     && make install
 
-# Limpiar archivos de compilación
 WORKDIR /
 RUN rm -rf /tmp/pgvector

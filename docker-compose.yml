@@ -118,7 +118,7 @@ services:
     restart: always
     networks:
       - cinesense_net
-      
+
   webapp:
     build: 
       context: ./webapp 
@@ -132,11 +132,8 @@ services:
       - .:/app 
     working_dir: /app 
     command: python webapp/app.py
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.webapp.rule=Host(`cinesense.local`)"
-      - "traefik.http.routers.webapp.entrypoints=web"
-      - "traefik.http.services.webapp.loadbalancer.server.port=5000"
+    ports:
+      - "5000:5000" 
     depends_on:
       - rabbitmq
       - traefik
@@ -144,7 +141,6 @@ services:
     restart: always
     networks:
       - cinesense_net
-
 
 volumes:
   db-data:

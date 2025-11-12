@@ -7,4 +7,5 @@ requests
 sentence-transformers
 numpy
 google-genai
-
+pydub
+google-cloud-speech

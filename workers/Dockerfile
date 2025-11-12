@@ -10,7 +10,6 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# INICIO DE LA INSTALACIÓN DE LIBRERÍAS (VERSION 20251110) <-- ¡AÑADE ESTO!
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .

@@ -86,21 +86,44 @@ def init_gemini_client():
     return False
 
 # --- FUNCIÓN DE REESCRITURA CON GEMINI ---
+# worker_recomendador.py
+
 def rewrite_synopsis_with_gemini(synopsis: str, emotion: str) -> str:
     """
     Usa la API de Gemini para reescribir la sinopsis, ajustando el tono a la emoción.
+    La lógica se amplía para manejar más estados de ánimo con instrucciones específicas.
     """
     if not GEMINI_CLIENT:
         return synopsis # Retorna el original si el cliente no está disponible
     
-    # Prompt para personalizar la sinopsis
+    # 1. Lógica de mapeo de emoción a instrucción específica
+    emotion_lower = emotion.lower()
+    tone_instruction = ""
+
+    if any(keyword in emotion_lower for keyword in ["tristeza", "miedo", "melancolía", "duelo", "decepcionado"]):
+        # 😢 Emociones Tristes o de Miedo
+        tone_instruction = "enfoca el resumen en la superación, la esperanza, el consuelo o la catarsis."
+    elif any(keyword in emotion_lower for keyword in ["alegría", "diversión", "felicidad", "entusiasmo", "feliz"]):
+        # 😄 Emociones Alegres
+        tone_instruction = "resalta el humor, la aventura, la ligereza y la energía positiva."
+    elif any(keyword in emotion_lower for keyword in ["enojo", "ira", "asco", "frustración", "rabia", "molesto"]):
+        # 😠 Emociones de Enojo o Negativas Intensas
+        tone_instruction = "enfoca el resumen en la acción, la justicia, la liberación de tensión o la comedia oscura."
+    elif any(keyword in emotion_lower for keyword in ["calma", "relajación", "paz", "tranquilidad", "serenidad", "neutro"]):
+        # 😌 Emociones de Calma o Reflexivas
+        tone_instruction = "enfoca el resumen en la contemplación, la belleza visual, el drama reflexivo o la intriga intelectual."
+    else:
+        # 🤷 Por defecto, para emociones no mapeadas (ej. 'sorpresa', 'nostalgia')
+        tone_instruction = "mantén un tono atractivo y enfocado en el misterio, la intriga y el entretenimiento general."
+
+
+    # 2. Prompt para personalizar la sinopsis
     prompt = f"""
     Eres un experto en marketing de películas. Reescribe la siguiente sinopsis para hacerla 
     extremadamente atractiva y relevante para un usuario que se siente **{emotion}**.
 
     Mantente fiel al argumento central. Ajusta el tono para apelar a la emoción del usuario:
-    - Si la emoción es 'Tristeza' o 'Miedo', enfoca el resumen en la superación, la esperanza o la catarsis.
-    - Si la emoción es 'Alegría' o 'Diversión', resalta el humor, la aventura y la energía positiva.
+    - {tone_instruction}
 
     El resultado debe ser **solo la sinopsis reescrita**, sin encabezados, comillas ni explicaciones adicionales. Máximo 3 frases.
 
@@ -114,7 +137,6 @@ def rewrite_synopsis_with_gemini(synopsis: str, emotion: str) -> str:
             contents=prompt
         )
         new_synopsis = response.text.strip().replace('"', '')
-        # print(f"✨ Sinopsis reescrita para '{emotion}'.")
         return new_synopsis
     except APIError as e:
         print(f"⚠️ Error en la llamada a la API de Gemini. Fallback a sinopsis original: {e}")

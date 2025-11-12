@@ -1,0 +1,5 @@
+Flask
+pika
+python-dotenv
+pydub
+google-cloud-speech
